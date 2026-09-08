@@ -20,6 +20,55 @@ def extract(body):
 
 
 class TableTitleTests(unittest.TestCase):
+    def test_income_tax_tables_use_their_own_last_sentences(self):
+        provision = 'Our income tax (provision) benefit consisted of the following:'
+        reconciliation = ('The table below reconciles our tax (provision) benefit based on the U.S. '
+                          'federal statutory rate to our effective rate:')
+        body = ('<h2>Note 25. Income Taxes</h2><p>Background discussion. ' + provision + '</p>'
+                + TABLE.format(caption='') + '<p>' + reconciliation + '</p>'
+                + TABLE.format(caption=''))
+        current = extract(body)
+        previous = extract(body.replace('Note 25. Income Taxes', 'Income Taxes'))
+        self.assertEqual([t.title for t in current], [provision, reconciliation])
+        document = build_json_result(previous, current, {
+            'Company': 'Micron', 'Item': '7', 'Previous Fiscal Year': 2024, 'Current Fiscal Year': 2025})
+        rows = make_annotations(document)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row['Current Section / Subsection'] for row in rows], [provision, reconciliation])
+        self.assertTrue(all(row['Previous Disclosure JSON'] and row['Current Disclosure JSON'] for row in rows))
+        self.assertNotEqual(rows[0]['Current Table / Chunk ID'], rows[1]['Current Table / Chunk ID'])
+        self.assertEqual(make_annotations(document, 'Income Taxes'), rows)
+        self.assertEqual(make_annotations(document, reconciliation), [rows[1]])
+        for title in (provision, reconciliation):
+            metadata = document['current']['table_metadata'][title]
+            self.assertEqual(metadata['source_section'], 'Note 25. Income Taxes')
+            self.assertEqual(metadata['introductory_sentence'], title)
+            self.assertEqual(metadata['title_basis'], 'preceding_sentence')
+
+    def test_single_income_tax_table_keeps_section_heading(self):
+        body = ('<h2>Note 25. Income Taxes</h2>'
+                '<p>Our income tax (provision) benefit consisted of the following:</p>'
+                + TABLE.format(caption=''))
+        table, = extract(body)
+        self.assertEqual(table.title, 'Note 25. Income Taxes')
+        self.assertEqual(table.title_basis, 'section_heading')
+
+    def test_repeated_intro_sentences_never_merge_physical_tables(self):
+        body = ('<h2>Income Taxes</h2>'
+                + ('<p>The amounts were as follows:</p>' + TABLE.format(caption='')) * 2)
+        tables = extract(body)
+        self.assertEqual([t.title for t in tables],
+                         ['The amounts were as follows: [Table 1]', 'The amounts were as follows: [Table 2]'])
+        data, _, count = build_tables_json(tables)
+        self.assertEqual(len(data), 2)
+        self.assertEqual(count, 8)
+
+    def test_layout_table_does_not_turn_single_table_section_into_multi_table_section(self):
+        body = ('<h2>Income Taxes</h2><table><tr><td>Navigation</td><td>Contents</td></tr></table>'
+                '<p>Amounts are presented below:</p>' + TABLE.format(caption=''))
+        table, = extract(body)
+        self.assertEqual(table.title, 'Income Taxes')
+
     def test_income_taxes_inline_heading_sharing_wrapper_with_table(self):
         interest = ('<p><b><i>Interest Income (Expense), Net:</i></b> '
                     'Interest income (expense) deteriorated for 2024 as compared to 2023 '
@@ -82,15 +131,16 @@ class TableTitleTests(unittest.TestCase):
                 + TABLE.format(caption=''))
         self.assertEqual(extract(body)[0].title, 'Operating Expenses')
 
-    def test_liquidity_tables_still_merge_despite_different_introductory_sentences(self):
+    def test_multi_table_sections_use_distinct_introductory_sentences(self):
         body = ('<h2>Liquidity and Capital Resources</h2>'
                 '<p>Cash balances were as follows:</p>' + TABLE.format(caption='')
                 + '<p>Our cash flows for the year were as follows:</p>' + TABLE.format(caption=''))
         tables = extract(body)
-        self.assertEqual([t.title for t in tables], ['Liquidity and Capital Resources'] * 2)
+        titles = ['Cash balances were as follows:', 'Our cash flows for the year were as follows:']
+        self.assertEqual([t.title for t in tables], titles)
         data, metadata, count = build_tables_json(tables)
-        self.assertEqual(list(data), ['Liquidity and Capital Resources'])
-        self.assertEqual(len(metadata['Liquidity and Capital Resources']['source_tables']), 2)
+        self.assertEqual(list(data), titles)
+        self.assertEqual([metadata[t]['source_section'] for t in titles], ['Liquidity and Capital Resources'] * 2)
         self.assertEqual(count, 8)
 
     def test_formatted_direct_customers_label_introduces_specific_table(self):
@@ -101,7 +151,7 @@ class TableTitleTests(unittest.TestCase):
                 + '<p><i>Direct Customers</i>' + intro[len('Direct Customers'):] + '</p>'
                 + TABLE.format(caption=''))
         first, second = extract(body)
-        self.assertEqual(first.title, 'Operating Income by Reportable Segments')
+        self.assertEqual(first.title, 'Operating Income by Reportable Segments [Table 1]')
         self.assertEqual(second.title, intro)
 
     def test_caption_overrides_heading_and_inline_intro(self):

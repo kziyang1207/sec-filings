@@ -3,9 +3,10 @@
 
 Keep this file beside compare_html_tables.py and table_titles.py. Extraction arguments such as
 --ticker, --cik, --company, --previous-year, --current-year, --item and
---user-agent are passed directly to that program. Alternatively, use --input
+--user-agent are passed directly to that program. By default, extract Items 7
+and 8; use --item to select a single Item. Alternatively, use --input
 to export an existing result.json without fetching filings again. Omit --table
-to include every extracted table in the Item, one table pair per annotation row.
+to include every extracted table, one table pair per annotation row.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from html import escape
 
 from table_titles import normalize_table_title
 
-VERSION = '1.4.2'
+VERSION = '1.5.1'
 COLUMNS = [
     'Annotator', 'Company', 'Industry', 'Split', 'Filing Form',
     'Previous Fiscal Year', 'Current Fiscal Year', 'Item',
@@ -54,9 +55,18 @@ def read_result(path):
     result = json.loads(Path(path).read_text(encoding='utf-8-sig'), object_pairs_hook=unique_object)
     if not isinstance(result, dict):
         raise ValueError('Expected a JSON object from compare_html_tables.py.')
-    for side in ('previous', 'current'):
-        if not isinstance(result.get(side), dict) or result[side].get('fiscal_year') is None:
-            raise ValueError(f'Input is missing the {side} filing or its fiscal year.')
+    documents = [result]
+    if 'items' in result:
+        if not isinstance(result['items'], dict) or not result['items']:
+            raise ValueError('Expected a nonempty items object in combined JSON.')
+        documents = list(result['items'].values())
+        for item, document in result['items'].items():
+            if not isinstance(document, dict) or document.get('item') != item:
+                raise ValueError(f'Combined JSON has an invalid document for Item {item}.')
+    for document in documents:
+        for side in ('previous', 'current'):
+            if not isinstance(document.get(side), dict) or document[side].get('fiscal_year') is None:
+                raise ValueError(f'Input is missing the {side} filing or its fiscal year.')
     return result
 
 
@@ -79,6 +89,13 @@ def select_table(filing, requested_title, side, *, allow_missing=False):
     content = {name: tables[name]}
     compact = json.dumps(content, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
     return name, compact
+
+
+def matching_table_names(filing, title):
+    key = normalize_table_title(title)
+    metadata = filing.get('table_metadata', {})
+    return [name for name in filing['tables'] if normalize_table_title(name) == key
+            or normalize_table_title(metadata.get(name, {}).get('source_section', '')) == key]
 
 
 def table_chunk_ids(filing, company):
@@ -146,10 +163,14 @@ def make_annotation(document, title, *, annotator='', previous_section=None,
 
 
 def make_annotations(document, title=None, **options):
+    selected = None
     if title is not None:
         if not title.strip():
             raise ValueError('--table must be a title; omit it to export all tables.')
-        return [make_annotation(document, title, **options)]
+        selected = {normalize_table_title(name) for side in ('previous', 'current')
+                    for name in matching_table_names(document[side], title)}
+        if not selected:
+            raise ValueError(f'Table or section {title!r} is absent from both filings.')
     # Preserve current filing order, then append previous-only tables. Matching
     # ignores leading note numbers and case/spacing; other renames stay separate.
     titles = {}
@@ -169,7 +190,7 @@ def make_annotations(document, title=None, **options):
     if not titles:
         raise ValueError('No tables are available in either filing.')
     return [make_annotation(document, name, allow_missing=True, **options)
-            for name in titles.values()]
+            for key, name in titles.items() if selected is None or key in selected]
 
 
 def safe_cell(value):
@@ -209,7 +230,8 @@ def clipboard_rows_page(rows, tsv):
     # Do not allow filing text to terminate the inert JSON script element.
     encoded = json.dumps(payload, ensure_ascii=False).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
     values = rows[0]
-    summary = escape(f'{values[1]} · {values[5]} → {values[6]} · Item {values[7]} · {len(rows)} annotation row(s)')
+    items = ', '.join(dict.fromkeys(row[7] for row in rows))
+    summary = escape(f'{values[1]} · {values[5]} → {values[6]} · Items {items} · {len(rows)} annotation row(s)')
     return '''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Copy annotation to Google Sheets</title>
@@ -319,11 +341,49 @@ def run_extractor(arguments):
     return compare_html_tables.main(arguments)
 
 
+def item_option(value):
+    item = re.sub(r'^item\s*', '', value.strip(), flags=re.I).upper().rstrip('.')
+    if not re.fullmatch(r'(?:[1-9]|1[0-6])[A-C]?', item):
+        raise argparse.ArgumentTypeError('Choose one Item, e.g. 7 or 8; omit --item for both.')
+    return item
+
+
+def number_combined_pages(documents):
+    """Keep IDs unique when Items share a printed page; run before title filtering."""
+    for side in ('previous', 'current'):
+        counts = Counter()
+        for document in documents:
+            filing = document[side]
+            for name, chunk_id in table_chunk_ids(filing, document.get('company', '')).items():
+                page_key = chunk_id.rsplit('_', 1)[0]
+                counts[page_key] += 1
+                filing['table_metadata'][name]['page_chunk_index'] = counts[page_key]
+
+
+def filter_document_tables(document, title):
+    """Filter saved JSON as well as rows, after assigning stable page counters."""
+    for side in ('previous', 'current'):
+        filing = document[side]
+        selected = set(matching_table_names(filing, title))
+        filing['tables'] = {name: data for name, data in filing['tables'].items()
+                            if name in selected}
+        filing['table_metadata'] = {name: data for name, data in filing.get('table_metadata', {}).items()
+                                    if name in filing['tables']}
+        if 'extraction' in filing:
+            sources = list(filing['table_metadata'].values())
+            filing['extraction'].update({
+                'heading_count': len(filing['tables']),
+                'table_count': sum(len(s.get('source_tables', [s])) for s in sources),
+                'source_cells_exported': sum(s.get('source_cells', 0) for s in sources),
+            })
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--input', type=Path, help='Optional existing result.json; skips extraction')
-    parser.add_argument('--table', help='Optional table title; ignores leading note numbers, case and whitespace. Omit for all tables in the Item')
+    parser.add_argument('--item', type=item_option, help='Extract one Item instead of the default Items 7 and 8; with --input, select an Item from the saved JSON')
+    parser.add_argument('--table', help='Optional table title or source section heading; ignores leading note numbers, case and whitespace. Omit for all tables')
     parser.add_argument(
         '--output-dir',
         type=Path,
@@ -346,6 +406,12 @@ def main(argv=None):
             raise ValueError('Supply filing/API arguments, e.g. --ticker MU --previous-year 2024 '
                              '--current-year 2025 --item 7 --user-agent "Your name and email"; '
                              'or supply --input result.json.')
+        if args.table is not None and not args.table.strip():
+            raise ValueError('--table must be a title; omit it to export all tables.')
+        if args.input is None and args.item is None and any(
+                a.split('=', 1)[0] in {'--previous-item-xpath', '--current-item-xpath',
+                                      '--previous-end-xpath', '--current-end-xpath'} for a in extraction_args):
+            raise ValueError('Explicit XPath boundaries require --item to identify the selected Item.')
         out = args.output_dir.expanduser().resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         # A fresh staging directory prevents a failed extractor from reusing a
@@ -353,27 +419,54 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix='table_annotation_run_', dir=out.parent) as folder:
             staging = Path(folder)
             if args.input is None:
-                selection = 'the selected table' if args.table is not None else 'all supported tables in the selected Item'
-                print(f'Step 1/2: extract {selection} from both filings.', flush=True)
-                table_args = ['--table', args.table] if args.table is not None else []
-                code = run_extractor(extraction_args + [
-                    '--output-format', 'json', '--output-dir', str(staging)] + table_args)
-                if code != 0:
-                    raise ValueError('HTML extraction failed. No new annotation TSV was exported.')
+                items = [args.item] if args.item else ['7', '8']
+                print(f'Step 1/2: extract Items {", ".join(items)} from both filings.', flush=True)
+                documents = []
+                shared_args = list(extraction_args)
+                if len(items) > 1 and not any(a.split('=', 1)[0] == '--cache-dir' for a in shared_args):
+                    shared_args += ['--cache-dir', str(staging/'filing_cache')]
+                for index, item in enumerate(items):
+                    item_out = staging/f'item{item}'
+                    # Refresh shared SEC data once, then reuse it for the next Item.
+                    run_args = [a for a in shared_args if not (index and a == '--refresh-cache')]
+                    code = run_extractor(run_args + [
+                        '--item', item, '--output-format', 'json', '--output-dir', str(item_out)])
+                    if code != 0:
+                        raise ValueError(f'Item {item} extraction failed. No new annotation TSV was exported.')
+                    documents.append(read_result(item_out/'result.json'))
+                if len(documents) > 1:
+                    number_combined_pages(documents)
+                if args.table is not None:
+                    for document in documents:
+                        filter_document_tables(document, args.table)
+                result = documents[0] if len(documents) == 1 else {
+                    'schema_version': '2.0', 'generator_version': VERSION,
+                    'items': {document['item']: document for document in documents},
+                }
                 source = staging/'result.json'
+                source.write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + '\n', encoding='utf-8')
             else:
                 source = args.input.expanduser()
-            document = read_result(source)
-            if any('item_table_index' not in document[side].get('table_metadata', {}).get(name, {})
-                   for side in ('previous', 'current') for name in document[side].get('tables', {})):
-                print('Note: older JSON lacks Item table positions. Chunk IDs use the table order in that JSON; '
-                      're-extract with compare_html_tables.py v1.3.1+ for stable numbering when filtering.', flush=True)
-            records = make_annotations(
-                document, args.table, annotator=args.annotator,
-                previous_section=args.previous_section, current_section=args.current_section,
-                change_taxonomy=args.change_taxonomy, content_taxonomy=args.content_taxonomy,
-                materiality=args.materiality,
-            )
+                result = read_result(source)
+                documents = list(result['items'].values()) if 'items' in result else [result]
+                if args.item is not None:
+                    documents = [d for d in documents if item_option(str(d.get('item', ''))) == args.item]
+                    if not documents:
+                        raise ValueError(f'Item {args.item} is absent from the input JSON.')
+            records = []
+            for document in documents:
+                titles = [name for side in ('previous', 'current') for name in document[side]['tables']]
+                if not titles or (args.table is not None and not any(
+                        matching_table_names(document[side], args.table) for side in ('previous', 'current'))):
+                    continue
+                records.extend(make_annotations(
+                    document, args.table, annotator=args.annotator,
+                    previous_section=args.previous_section, current_section=args.current_section,
+                    change_taxonomy=args.change_taxonomy, content_taxonomy=args.content_taxonomy,
+                    materiality=args.materiality,
+                ))
+            if not records:
+                raise ValueError('No matching tables are available in the selected Items.')
             print(f'Step 2/2: export {len(records)} table-pair annotation row(s) in your 17-column format.', flush=True)
             files = export_annotations(records, staging)
             if args.input is None:

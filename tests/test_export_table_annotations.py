@@ -131,7 +131,7 @@ class ExportTableAnnotationsTests(unittest.TestCase):
         doc['current']['tables']['Note 9. ' + TITLE] = {'2025': {'Land': {'value': 99}}}
         with self.assertRaisesRegex(ValueError, 'ambiguous'):
             make_annotations(doc)
-        with self.assertRaisesRegex(ValueError, 'found 2'):
+        with self.assertRaisesRegex(ValueError, 'ambiguous'):
             make_annotations(doc, TITLE)
 
     def test_existing_json_can_be_reexported_without_modifying_it(self):

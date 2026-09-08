@@ -33,7 +33,7 @@ try:
 except ImportError:
     raise SystemExit('Install the dependency first: python -m pip install lxml')
 
-VERSION = '1.4.5'
+VERSION = '1.5.0'
 # Edit this list, or pass --columns columns.json, to reorder/remove/rename exports.
 ANNOTATION_COLUMNS = [
     'Company', 'Industry', 'Split', 'Filing Form', 'Previous Fiscal Year',
@@ -169,6 +169,9 @@ class Table:
     raw_grid: list[list[str]] = field(default_factory=list)
     header_context: str = ''
     page_chunk_index: int | None = None
+    source_section: str = ''
+    introductory_sentence: str = ''
+    title_basis: str = ''
 
 
 def expand_grid(table) -> tuple[list[list[Origin | None]], list[list[Origin]]]:
@@ -282,7 +285,8 @@ def title_furniture(value):
     return (not value or value.casefold() == 'table of contents'
             or re.fullmatch(r'\d+(?:\s*\|.*)?', value)
             or re.match(r'^(?:\*|\(\d+\)|Note:)', value, re.I)
-            or re.fullmatch(r'\(?In (?:millions|billions|thousands|percentages)[^)]*\)?', value, re.I))
+            or re.fullmatch(r'\(?(?:All(?: tabular)?(?: dollar)? amounts(?: are)? )?In '
+                            r'(?:millions|billions|thousands|percentages)[^)]*\)?', value, re.I))
 
 
 def last_intro_sentence(value):
@@ -342,6 +346,54 @@ def choose_table_title(node, previous, heading, previous_table_end):
             return intro
         break
     return heading[1].rstrip(':') if heading else intro
+
+
+def preceding_table_sentence(previous, heading, previous_table_end):
+    """Read only prose between this section/previous table and the current table."""
+    for position, value, block in reversed(previous):
+        if position <= previous_table_end or (heading and position < heading[0]):
+            break
+        if title_furniture(value) or ITEM_RE.match(value):
+            continue
+        if table_heading(value, block):
+            break
+        return last_intro_sentence(value)
+    return ''
+
+
+def name_section_tables(tables, contexts, section_counts):
+    """Split multi-table sections; preserve the section title for single tables."""
+    ordinals = Counter()
+    for table in tables:
+        section_key, caption = contexts[table.table_id]
+        ordinals[section_key] += 1
+        if section_counts[section_key] > 1:
+            if table.introductory_sentence:
+                table.title, table.title_basis = table.introductory_sentence, 'preceding_sentence'
+            elif caption:
+                table.title, table.title_basis = caption, 'caption'
+            else:
+                table.title = (f'{table.source_section} [Table {ordinals[section_key]}]'
+                               if table.source_section else f'Untitled table {table.index}')
+                table.title_basis = 'numbered_fallback'
+        elif table.source_section:
+            table.title, table.title_basis = caption or table.source_section, 'caption' if caption else 'section_heading'
+        else:
+            table.title_basis = 'caption' if caption else 'preceding_sentence' if table.introductory_sentence else 'fallback'
+    # Identical introductory sentences still represent separate physical tables.
+    counts = Counter(norm(t.title) for t in tables)
+    reserved = {norm(t.title) for t in tables}
+    used, repeats = set(), Counter()
+    for table in tables:
+        base, key = table.title, norm(table.title)
+        if counts[key] > 1 or key in used:
+            repeats[key] += 1
+            candidate = f'{base} [Table {repeats[key]}]'
+            while norm(candidate) in used or norm(candidate) in reserved:
+                repeats[key] += 1
+                candidate = f'{base} [Table {repeats[key]}]'
+            table.title = candidate
+        used.add(norm(table.title))
 
 
 def find_item(blocks, order, item: str) -> tuple[int, int, list[dict]]:
@@ -440,6 +492,7 @@ def parse_table(node, title: str, scale: str, unit_evidence: str, source_paths=N
     if not grid:
         raise ValueError('Empty table')
     year_row = None
+    shared_period = ''
     for ri, row in enumerate(origins[:12]):
         ys = [c for c in row if YEAR_RE.search(c.raw) and len(c.raw) < 80]
         # A year heading contains just years/dates, not ordinary numeric values.
@@ -452,6 +505,16 @@ def parse_table(node, title: str, scale: str, unit_evidence: str, source_paths=N
     if year_row is not None:
         year_cells = [c for c in origins[year_row] if YEAR_RE.search(c.raw) and len(c.raw) < 80]
         stub_end = min(c.start for c in year_cells)
+        # Segment columns share a year printed in the stub header, e.g.
+        # "For the year ended 2025 | CMBU | CDBU | ... | Total".
+        stub_header = year_cells[0]
+        if (len(year_cells) == 1 and stub_header.start == 0
+                and re.match(r'^(?:for (?:the )?year ended|year ended|as of)\b', stub_header.raw, re.I)
+                and len(YEAR_RE.findall(stub_header.raw)) == 1
+                and any(c.start >= stub_header.end and c.raw
+                        and numeric(c.raw)[0] == 'text' for c in origins[year_row])):
+            stub_end = stub_header.end
+            shared_period = YEAR_RE.search(stub_header.raw).group()
         scan_start = year_row + 1
     else:
         # Generic numerical tables with text headers are supported too.
@@ -486,30 +549,53 @@ def parse_table(node, title: str, scale: str, unit_evidence: str, source_paths=N
     # SEC accounting markup often puts $ / number / % in separate cells.
     # Right edges align values despite different colspans for currency prefixes.
     lanes = sorted({c.end for _, _, _, values in data for c in values})
+
+    def header_pieces(edge):
+        pieces = []
+        for rr in grid[:header_end]:
+            c = rr[edge - 1] if edge <= len(rr) else None
+            if c and c.raw and c.start >= stub_end and c.raw not in pieces:
+                pieces.append(c.raw)
+        return pieces
+
+    # Some rows span the spacer cell as well as the amount cell. Coalesce such
+    # edges only when they belong to the SAME header origins and never contain
+    # two separate numerical values on one row. Amount/percentage lanes remain
+    # separate even if they share a year heading.
+    header_lanes = defaultdict(list)
+    for edge in lanes:
+        identity = tuple(id(rr[edge - 1]) for rr in grid[:header_end]
+                         if edge <= len(rr) and rr[edge - 1] is not None
+                         and rr[edge - 1].raw and rr[edge - 1].start >= stub_end)
+        if identity:
+            header_lanes[identity].append(edge)
+    lane_alias = {}
+    for edges in header_lanes.values():
+        if len(edges) > 1 and all(sum(c.end in edges for c in values) <= 1
+                                  for _, _, _, values in data):
+            lane_alias.update({edge: max(edges) for edge in edges})
+    value_edge = lambda cell: lane_alias.get(cell.end, cell.end)
+    lanes = sorted({lane_alias.get(edge, edge) for edge in lanes})
     for ri, _, _, _ in data:
         for c in dedupe_origins(grid[ri]):
             if (c.start >= stub_end and numeric(c.raw)[0] == 'text' and c.raw not in {'%', '$', '€', '£', '¥'}
+                    and value_edge(c) not in lanes
                     and not any(c.start <= lane-1 < c.end for lane in lanes)):
                 raise ValueError('A non-numerical data column could not be aligned; inspect the preserved raw grid')
     headers = []
     for lane in lanes:
-        pos = lane - 1
-        pieces = []
-        for rr in grid[:header_end]:
-            c = rr[pos] if pos < len(rr) else None
-            if c and c.raw and c.start >= stub_end and c.raw not in pieces:
-                pieces.append(c.raw)
+        pieces = header_pieces(lane)
         if not pieces:
             raise ValueError(f'Value column ending at physical column {lane} has no header')
-        period = next((p for p in pieces if YEAR_RE.search(p)), '')
+        period = next((p for p in pieces if YEAR_RE.search(p)), shared_period)
         leaf = ' / '.join(p for p in pieces if p != period)
         percent_flags = []
         for ri, _, _, values in data:
             for c in values:
-                if c.end == lane:
+                if value_edge(c) == lane:
                     next_lane = next((x for x in lanes if x > lane), len(grid[ri]))
-                    suffix = ' '.join(x.raw for x in dedupe_origins(grid[ri][lane:next_lane])
-                                      if x.start >= lane)
+                    suffix = ' '.join(x.raw for x in dedupe_origins(grid[ri][c.end:next_lane])
+                                      if x.start >= c.end)
                     percent_flags.append('%' in c.raw or suffix.strip().startswith('%'))
         if percent_flags and all(percent_flags):
             measure = 'Percentage'
@@ -519,7 +605,7 @@ def parse_table(node, title: str, scale: str, unit_evidence: str, source_paths=N
             measure = 'Amount'
         if leaf:
             measure = leaf
-        header = ' / '.join(pieces + ([measure] if not leaf else []))
+        header = ' / '.join(([shared_period] if shared_period else []) + pieces + ([measure] if not leaf else []))
         # Units are deliberately excluded from the key so unit changes are detectable.
         key = norm(period) + '|' + norm(measure)
         headers.append(Column(key, header, period, measure, lane, period or norm(header)))
@@ -536,12 +622,17 @@ def parse_table(node, title: str, scale: str, unit_evidence: str, source_paths=N
         row = Row(f'r{ordinal:03d}', key, label, group, ri + 1, synthetic)
         rows.append(row)
         for col in headers:
-            matches = [v for v in values if v.end == col.physical_end]
+            matches = [v for v in values if value_edge(v) == col.physical_end]
             if len(matches) > 1:
                 raise ValueError('More than one value in a logical cell')
             value = matches[0] if matches else None
             if value is None:
-                candidate = grid[ri][col.physical_end - 1]
+                text_matches = [c for c in dedupe_origins(grid[ri])
+                                if c.start >= stub_end and value_edge(c) == col.physical_end
+                                and c.raw and c.raw not in CURRENCY and c.raw != '%']
+                if len(text_matches) > 1:
+                    raise ValueError('More than one text value in a logical cell')
+                candidate = text_matches[0] if text_matches else grid[ri][col.physical_end - 1]
                 if candidate and candidate.start >= stub_end and candidate.raw not in CURRENCY and candidate.raw != '%':
                     value = candidate
             # Capture each origin only once, and retain the source fragments.
@@ -552,10 +643,10 @@ def parse_table(node, title: str, scale: str, unit_evidence: str, source_paths=N
                 before = [c.raw for c in dedupe_origins(grid[ri][left:value.start])
                           if c.end <= value.start and c.raw in CURRENCY]
                 after = []
-                for c in dedupe_origins(grid[ri][lane:right]):
+                for c in dedupe_origins(grid[ri][value.end:right]):
                     if not c.raw:
                         continue
-                    if c.start >= lane and c.raw == '%':
+                    if c.start >= value.end and c.raw == '%':
                         after.append('%')
                     break
                 fragments = before + [value.raw] + after
@@ -895,6 +986,7 @@ def extract_tables(data: bytes, company: str, year: int, item: str, source: str 
     all_tables = [e for e in nodes if e.tag == 'table']
     raw_candidates = [e for e in all_tables if start < order[e] < end and not list(e.iter('table'))[1:]]
     page_counts = Counter()
+    section_counts, table_contexts = Counter(), {}
     output, skipped = [], []
     block_positions = [p for p, _, _ in section_blocks]
     previous_table_end = start
@@ -905,6 +997,8 @@ def extract_tables(data: bytes, company: str, year: int, item: str, source: str 
         previous = section_blocks[max(0, idx-8):idx]
         heading_index = bisect.bisect_left(title_positions, pos) - 1
         heading = title_headings[heading_index] if heading_index >= 0 else None
+        section_key = heading[0] if heading else start
+        intro = preceding_table_sentence(previous, heading, previous_table_end)
         title = choose_table_title(node, previous, heading, previous_table_end)
         previous_table_end = max(order[e] for e in node.iter())
         if not title:
@@ -931,11 +1025,13 @@ def extract_tables(data: bytes, company: str, year: int, item: str, source: str 
             # Navigation/layout tables have no financial values and are not annotations.
             amount_count = sum(numeric(v)[0] in {'number', 'dash'} for rr in raw for v in rr)
             if amount_count >= 2:
+                section_counts[section_key] += 1
                 page_counts[page or 'unknown'] += 1
                 unsupported_id = f'{slug(company)}_{year}_{page or "unknown"}_t{page_counts[page or "unknown"]}'
                 skipped.append({'table_id': unsupported_id, 'locator': locator, 'title': title, 'reason': str(exc), 'raw_grid': raw})
             continue
         page_counts[page or 'unknown'] += 1
+        section_counts[section_key] += 1
         tid = f'{slug(company)}_{year}_{page or "unknown"}_t{page_counts[page or "unknown"]}'
         if not page:
             warnings.append('Printed page unavailable; ID uses unknown, never the HTML/PDF file position.')
@@ -949,7 +1045,11 @@ def extract_tables(data: bytes, company: str, year: int, item: str, source: str 
         raw_grid, _ = expand_grid(node)
         output.append(Table(tid, title, page, locator, source, year, item, len(output)+1,
                             columns, rows, cells, notes, warnings, evidence,
-                            [[c.raw if c else '' for c in rr] for rr in raw_grid], header_context))
+                            [[c.raw if c else '' for c in rr] for rr in raw_grid], header_context,
+                            source_section=heading[1] if heading else '', introductory_sentence=intro))
+        caption = node.find('caption')
+        table_contexts[tid] = (section_key, text(caption) if caption is not None else '')
+    name_section_tables(output, table_contexts, section_counts)
     return output, {'item': item, 'start_position': start, 'end_position': end,
                     'headings': headings, 'candidate_tables': len(raw_candidates),
                     'unsupported_tables': skipped, 'sha256': hashlib.sha256(data).hexdigest()}
@@ -1441,6 +1541,9 @@ def build_tables_json(tables: list[Table]) -> tuple[dict, dict, int]:
             raise ValueError(f'{table.table_id}: some source cells were not exported.')
         source_metadata[title].append({
             'table_id': table.table_id, 'source_title': table.title,
+            'source_section': table.source_section,
+            'introductory_sentence': table.introductory_sentence,
+            'title_basis': table.title_basis,
             'item_table_index': table.index,
             'printed_page': table.page, 'source_url': table.source,
             'source_locator': table.locator, 'header_context': table.header_context,
@@ -1530,7 +1633,7 @@ def main(argv=None):
     identity.add_argument('--cik', help='Use the SEC API with a CIK instead of a ticker, e.g. 723125')
     parser.add_argument('--item', type=normalize_item, default='7')
     parser.add_argument('--filings-dir', default='.')
-    parser.add_argument('--table', help='Optional table title; ignores leading note numbers, case and whitespace. Otherwise all supported tables in the Item')
+    parser.add_argument('--table', help='Optional table title or source section heading; ignores leading note numbers, case and whitespace. Otherwise all supported tables in the Item')
     parser.add_argument('--output-dir', help='Default: data/table_output/<company>_<previous>_<current>_item_<item>_tables')
     parser.add_argument('--output-format', choices=['json', 'csv', 'both'], default='json',
                         help='json (default): nested table data; csv: comparison annotations; both: all outputs')
@@ -1642,7 +1745,8 @@ def main(argv=None):
         if args.table:
             for side in tables:
                 tables[side] = [t for t in tables[side]
-                                if normalize_table_title(t.title) == normalize_table_title(args.table)]
+                                if normalize_table_title(t.title) == normalize_table_title(args.table)
+                                or normalize_table_title(t.source_section) == normalize_table_title(args.table)]
             if not tables['previous'] and not tables['current']:
                 raise ValueError(f'Table title {args.table!r} was not found. Run without --table to inspect the available table titles.')
         meta = {'Company': args.company, 'Industry': '', 'Split': 'Development/Validation', 'Filing Form': '10-K',

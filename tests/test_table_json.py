@@ -82,18 +82,21 @@ class TableJsonTests(unittest.TestCase):
             self.assertEqual(code, 0)
             document = json.loads((output / 'result.json').read_text())
             for side in ['previous', 'current']:
-                self.assertEqual(list(document[side]['tables']), [TITLE])
+                self.assertEqual(list(document[side]['tables']), [TITLE+' [Table 1]', TITLE+' [Table 2]'])
                 self.assertEqual(document[side]['extraction']['source_cells_exported'], 12)
-                self.assertEqual(len(document[side]['table_metadata'][TITLE]['source_tables']), 2)
-            date = document['current']['tables'][TITLE]['Jan 26, 2025']
-            self.assertEqual(len(date), 6)
+                self.assertEqual(len(document[side]['table_metadata']), 2)
+            date = document['current']['tables'][TITLE+' [Table 1]']['Jan 26, 2025']
+            flows = document['current']['tables'][TITLE+' [Table 2]']['Jan 26, 2025']
+            self.assertEqual(len(date), 3)
+            self.assertEqual(len(flows), 3)
             self.assertEqual(date['Cash and cash equivalents']['value'], 8589)
-            self.assertEqual(date['Net cash used in investing activities']['value'], -20421)
+            self.assertEqual(flows['Net cash used in investing activities']['value'], -20421)
             with (output / 'table_annotations.tsv').open() as stream:
                 records = list(csv.DictReader(stream, delimiter='\t'))
-            self.assertEqual(len(records), 1)
-            self.assertTrue(records[0]['Previous Disclosure JSON'])
-            self.assertTrue(records[0]['Current Disclosure JSON'])
+            self.assertEqual(len(records), 2)
+            for record in records:
+                self.assertTrue(record['Previous Disclosure JSON'])
+                self.assertTrue(record['Current Disclosure JSON'])
 
     def test_combines_same_heading_by_date_and_preserves_all_sources(self):
         cash = source_table(2025, 7, ['Cash and cash equivalents', 'Marketable securities'],

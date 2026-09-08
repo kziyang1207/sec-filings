@@ -117,41 +117,17 @@ The converter keeps the original CSV columns, updates the previous/current chunk
 
 # HTML 10-K tables to nested JSON
 
-Extract numerical tables from **one selected Item** of two full 10-K HTML filings.
 Nested JSON is the default output. Main extractor version 1.3.0 adds verified labels for unlabelled footer totals and explicit nulls for missing percentage displays. The existing CSV comparison remains available with `--output-format csv` or `--output-format both`.
 
 It runs locally using Python 3.10+ and `lxml`. No LLM, API key, pandas, browser automation, or PDF parsing is involved.
 
-Tables with the same heading within an Item are combined into one JSON entry
-(ignoring heading case and extra whitespace). For example, NVIDIA's cash balances
-and cash flows appear together under `Liquidity and Capital Resources`, grouped
-by date. Distinct dates and measures are retained. Repeated row labels receive
-source-table/row suffixes so no values are overwritten, even if they are equal.
-The combined entry's `table_metadata.source_tables` records each original table,
-including its headers, source location, and exported row paths. This preserves
-the distinction between balance dates and year-ended cash flows in the source.
 Annotation chunk IDs use `table_[company]_[year]_[page]_[xx]`, for example
 `table_nvidia_2025_43_01`. Company names are lowercase with punctuation/spaces
 replaced by underscores. `page` is the printed filing page; `xx` is a per-page
 counter (`01`, `02`, ...) that restarts at `01` on each new page.
-Combined headings count as one chunk on their first source table's page.
-`page_chunk_index` is assigned before `--table` filtering to keep IDs stable;
-older JSON falls back to counting its available headings in source order.
-`item_table_indices` lists all contributing positions. Missing page metadata
-uses `unknown`, never an inferred page number. Missing company labels use
-`company`. Re-export existing JSON with `--input` to apply the new IDs.
-JSON schema version 1.2
-keeps `extraction.table_count` as the source-table count and adds `heading_count`.
-Single-table metadata and the optional CSV comparison retain their existing format.
-Rerun extraction to update old JSON/TSV files; `--input` exports existing JSON as-is.
 
-Table titles prefer an explicit caption, then the current section heading, even
-when introductory paragraphs separate that heading from the table. Ordinary
-prose never replaces an existing heading. A formatted inline label such as
-italic `Direct Customers –` can introduce a more specific table; its full last
-sentence becomes the title. Otherwise, the last preceding sentence is used only
-when no heading exists. Table contents, page numbers, unit lines, and marked
-footnotes are excluded. Prose is not reused across an intervening table.
+Table contents, page numbers, unit lines, and marked footnotes are excluded from
+introductory sentences. Prose is not reused across an intervening table or section.
 Formatted colon labels such as `Income Taxes: Our income tax ...` use only
 `Income Taxes` as the heading. Introductory text is retained even when it shares
 an HTML wrapper with a table; table cells and following prose stay separate.
@@ -171,11 +147,18 @@ no new filing download is required.
 ```bash
 python export_table_annotations.py \
   --ticker MU --company Micron \
-  --previous-year 2024 --current-year 2025 --item 7 \
+  --previous-year 2024 --current-year 2025 \
   --user-agent "Your name your-email@example.com" \
-  --output-dir data/table_output/item7_all_tables_annotations
+  --output-dir data/table_output/micron_items7_8_annotations
 ```
-or the command below if you wish to get result from specify table
+
+This produces one combined TSV and copy page, ordered by Item 7 then Item 8.
+Each row retains its Item number; matching stays within that Item.
+Page counters continue across Items when they share a printed
+page, keeping chunk IDs unique. SEC API runs reuse a shared cache between Items.
+If either Item fails to extract, no previous successful output is replaced.
+
+Use `--item 7` for only Item 7, or `--item 8` for only Item 8. To select one table:
 
 ```bash
 python export_table_annotations.py \
@@ -188,13 +171,17 @@ python export_table_annotations.py \
 
 Replace the contact details with your own. If `--output-dir` is omitted, table annotation files are written under `data/table_output/table_annotation_export/`.
 
+With `--table` but no `--item`, the exporter searches both Items and includes
+matches wherever present, including a table that exists in only one year.
+Without `--table`, all supported tables are included.
+
 The output folder contains:
 
 | File | Purpose |
 |---|---|
-| `result.json` | The selected table from each filing, plus the extractor's provenance. |
-| `table_annotations.tsv` | Your 17 columns with a header and one complete table-pair annotation row. |
-| `paste_into_sheets.tsv` | The same annotation row without a header, using fully quoted TSV fields. |
+| `result.json` | Extracted tables and provenance. Default: combined schema 2.0 with `items["7"]` and `items["8"]`. Explicit `--item`: existing single-Item format. |
+| `table_annotations.tsv` | Your 17 columns with a header and one row per table pair across the selected Items. |
+| `paste_into_sheets.tsv` | The same annotation rows without a header, using fully quoted TSV fields. |
 | `paste_into_sheets.html` | A local copy helper that supplies a 17-cell HTML table and a quoted-text fallback to the clipboard. |
 
-Open **`paste_into_sheets.html` in your browser**, click **Copy row**, single-click column **A** of an empty annotation row in Google Sheets, then paste normally with **Cmd+V / Ctrl+V**.
+Open **`paste_into_sheets.html` in your browser**, click **Copy all rows**, single-click column **A** of an empty annotation row in Google Sheets, then paste normally with **Cmd+V / Ctrl+V**.
